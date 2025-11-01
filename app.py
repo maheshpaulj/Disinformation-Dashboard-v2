@@ -1,834 +1,303 @@
-# ==============================================================================
-# FP-2 PROJECT: PART 4 - INTERACTIVE STREAMLIT DASHBOARD
-# ==============================================================================
-# Save this file as: dashboard_app.py
-# Run with: streamlit run dashboard_app.py
-# ==============================================================================
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import networkx as nx
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import networkx as nx
-from datetime import datetime, timedelta
-import pickle
+from sklearn.feature_extraction.text import TfidfVectorizer
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+import spacy
 from collections import Counter
-import json
 
-# Page configuration
+# ==============================================================================
+# PAGE CONFIGURATION
+# ==============================================================================
 st.set_page_config(
     page_title="Disinformation Ecosystem Dashboard",
-    page_icon="🔍",
+    page_icon="🕸️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS
+# --- Custom CSS for a professional look ---
 st.markdown("""
     <style>
     .main-header {
         font-size: 2.5rem;
         font-weight: bold;
-        color: #2c3e50;
+        color: #FFFFFF;
         text-align: center;
         padding: 1rem;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        color: white;
+        background: linear-gradient(90deg, #4b6cb7 0%, #182848 100%);
         border-radius: 10px;
         margin-bottom: 2rem;
+        text-shadow: 2px 2px 4px #000000;
     }
     .metric-card {
-        background-color: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border-left: 5px solid #667eea;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .insight-box {
-        background-color: #fff3cd;
         padding: 1rem;
-        border-radius: 5px;
-        border-left: 4px solid #ffc107;
-        margin: 1rem 0;
+        border-radius: 10px;
+        border-left: 5px solid #4b6cb7;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        background-color: #f8f9fa;
+    }
+    .stMetric {
+        text-align: center;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: #F0F2F6;
+        border-radius: 4px 4px 0px 0px;
+        gap: 1px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #FFFFFF;
     }
     </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# DATA LOADING FUNCTIONS
+# DATA LOADING & CACHING
 # ==============================================================================
-
 @st.cache_data
-def load_processed_data(file_path):
-    """Load processed data with embeddings and features."""
+def load_data():
     try:
-        df = pd.read_pickle(file_path)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        return df
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
+        df = pd.read_pickle('data/processed_data_with_features.pkl')
+        cluster_df = pd.read_pickle('data/final_clusters_with_metadata.pkl')
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        cluster_df['start_date'] = pd.to_datetime(cluster_df['start_date'])
+        cluster_df = cluster_df.sort_values('size', ascending=False).reset_index(drop=True)
+        return df, cluster_df
+    except FileNotFoundError as e:
+        st.error(f"ERROR: Data file not found: `{e.filename}`. Please ensure data files are in the correct subdirectories (`data/`, `results/networks/`).")
+        return None, None
+
+@st.cache_resource
+def load_network_graph():
+    try:
+        return nx.read_gexf('results/networks/author_network.gexf')
+    except FileNotFoundError:
+        st.sidebar.warning("`author_network.gexf` not found. Network analysis will be limited.")
         return None
 
-@st.cache_data
-def load_cluster_metadata(file_path):
-    """Load cluster analysis results."""
+@st.cache_resource
+def load_spacy_model():
     try:
-        df = pd.read_pickle(file_path)
-        return df
-    except Exception as e:
-        st.error(f"Error loading clusters: {e}")
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        st.sidebar.warning("SpaCy model not found. NER disabled. Run: `python -m spacy download en_core_web_sm`")
         return None
 
+df, cluster_df = load_data()
+nlp = load_spacy_model()
+author_network = load_network_graph()
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
 @st.cache_data
-def load_network_data(file_path):
-    """Load network analysis results."""
-    try:
-        with open(file_path, 'rb') as f:
-            return pickle.load(f)
-    except Exception as e:
-        st.error(f"Error loading network: {e}")
-        return None
+def get_top_entities(posts, _nlp_model, top_n=10):
+    if _nlp_model is None or posts.empty: return {}
+    text = " ".join(posts['text_clean'].head(100))
+    doc = _nlp_model(text[:1000000])
+    entities = Counter()
+    for ent in doc.ents:
+        if ent.label_ in ['PERSON', 'ORG', 'GPE']:
+            entities[ent.text.strip().title()] += 1
+    return dict(entities.most_common(top_n))
+
+@st.cache_data
+def generate_wordcloud(posts):
+    text = ' '.join(posts['text_clean'].dropna())
+    if not text: return None
+    wordcloud = WordCloud(width=800, height=400, background_color='white', colormap='viridis').generate(text)
+    return wordcloud.to_array()
 
 # ==============================================================================
-# MAIN DASHBOARD
+# MAIN DASHBOARD LAYOUT
 # ==============================================================================
 
-def main():
-    # Header
-    st.markdown('<div class="main-header">🔍 Time-Aware Multi-Platform Disinformation Ecosystem Dashboard</div>', 
-                unsafe_allow_html=True)
+if df is None:
+    st.stop()
+
+st.markdown('<div class="main-header">Disinformation Ecosystem Dashboard</div>', unsafe_allow_html=True)
+
+# --- SIDEBAR FILTERS ---
+st.sidebar.title("🔬 Filters & Controls")
+date_range = st.sidebar.slider("Date Range", df['timestamp'].min().date(), df['timestamp'].max().date(), (df['timestamp'].min().date(), df['timestamp'].max().date()))
+selected_platforms = st.sidebar.multiselect("Platforms", df['source'].unique(), df['source'].unique())
+
+filtered_df = df[(df['timestamp'].dt.date >= date_range[0]) & (df['timestamp'].dt.date <= date_range[1]) & (df['source'].isin(selected_platforms))]
+valid_clusters = filtered_df[~filtered_df['cluster_global'].str.endswith('-1')]['cluster_global'].unique()
+filtered_cluster_df = cluster_df[cluster_df['cluster_id'].isin(valid_clusters)].copy()
+
+st.sidebar.info(f"Displaying **{len(filtered_df):,}** posts matching filters.")
+
+# --- TABS ---
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🎯 Narrative Explorer", "🕸️ Network Analysis", "⚙️ Methodology"])
+
+# ==============================================================================
+# TAB 1: OVERVIEW
+# ==============================================================================
+with tab1:
+    st.header("Ecosystem at a Glance")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.markdown(f"<div class='metric-card'> <h4>Total Posts</h4> <h1>{len(filtered_df):,}</h1> </div>", unsafe_allow_html=True)
+    with col2: st.markdown(f"<div class='metric-card'> <h4>Narratives</h4> <h1>{len(filtered_cluster_df):,}</h1> </div>", unsafe_allow_html=True)
+    with col3: st.markdown(f"<div class='metric-card'> <h4>Unique Authors</h4> <h1>{filtered_df['author'].nunique():,}</h1> </div>", unsafe_allow_html=True)
+    with col4: st.markdown(f"<div class='metric-card'> <h4>Platforms</h4> <h1>{len(selected_platforms)}</h1> </div>", unsafe_allow_html=True)
+
+    st.markdown("---")
     
-    # Sidebar - Data Loading
-    st.sidebar.title("📁 Data Configuration")
-    
-    # File paths
-    data_path = st.sidebar.text_input(
-        "Processed Data Path",
-        value="processed_data_with_features.pkl",
-        help="Path to processed dataset from Part 2"
-    )
-    
-    cluster_path = st.sidebar.text_input(
-        "Cluster Metadata Path",
-        value="final_clusters_with_metadata.pkl",
-        help="Path to cluster metadata from Part 2"
-    )
-    
-    # Load data
-    if st.sidebar.button("🔄 Load Data", type="primary"):
-        with st.spinner("Loading data..."):
-            st.session_state['df'] = load_processed_data(data_path)
-            st.session_state['clusters'] = load_cluster_metadata(cluster_path)
-        
-        if st.session_state['df'] is not None:
-            st.sidebar.success("✅ Data loaded successfully!")
-    
-    # Check if data is loaded
-    if 'df' not in st.session_state or st.session_state['df'] is None:
-        st.info("👈 Please load data from the sidebar to begin analysis")
-        st.stop()
-    
-    df = st.session_state['df']
-    clusters = st.session_state['clusters'] if 'clusters' in st.session_state else None
-    
-    # Sidebar - Filters
-    st.sidebar.title("🎯 Filters")
-    
-    # Date range filter
-    min_date = df['timestamp'].min().date()
-    max_date = df['timestamp'].max().date()
-    
-    date_range = st.sidebar.date_input(
-        "Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    # Platform filter
-    platforms = st.sidebar.multiselect(
-        "Platforms",
-        options=df['source'].unique(),
-        default=df['source'].unique()
-    )
-    
-    # Apply filters
-    mask = (df['timestamp'].dt.date >= date_range[0]) & \
-           (df['timestamp'].dt.date <= date_range[1]) & \
-           (df['source'].isin(platforms))
-    
-    df_filtered = df[mask]
-    
-    st.sidebar.metric("Filtered Posts", f"{len(df_filtered):,}")
-    
-    # ==============================================================================
-    # TAB NAVIGATION
-    # ==============================================================================
-    
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Overview",
-        "🕸️ Network Analysis", 
-        "📈 Temporal Analysis",
-        "🎯 Cluster Explorer",
-        "⚠️ Disinformation Analysis",
-        "🔍 Search & Investigate"
-    ])
-    
-    # ==============================================================================
-    # TAB 1: OVERVIEW
-    # ==============================================================================
-    
-    with tab1:
-        st.header("📊 Dataset Overview")
-        
-        # Key metrics
-        col1, col2, col3, col4, col5 = st.columns(5)
-        
+    st.subheader("Activity Over Time")
+    time_series_data = filtered_df.set_index('timestamp').resample('ME').size()
+    st.plotly_chart(px.area(time_series_data, x=time_series_data.index, y=time_series_data.values, labels={'y': 'Posts', 'x': 'Date'}, title="Monthly Post Volume"), use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Platform Distribution")
+        platform_counts = filtered_df['source'].value_counts()
+        st.plotly_chart(px.pie(platform_counts, values=platform_counts.values, names=platform_counts.index), use_container_width=True)
+    with c2:
+        st.subheader("Top 10 Narratives")
+        st.dataframe(filtered_cluster_df[['cluster_id', 'size', 'duration_days']].head(10), use_container_width=True)
+
+# ==============================================================================
+# TAB 2: NARRATIVE EXPLORER
+# ==============================================================================
+with tab2:
+    st.header("🎯 Narrative Explorer")
+    if filtered_cluster_df.empty:
+        st.warning("No narratives match the current filter settings.")
+    else:
+        selected_cluster_id = st.selectbox("Select a Narrative (sorted by size)", filtered_cluster_df['cluster_id'].tolist())
+        cluster_details = filtered_cluster_df[filtered_cluster_df['cluster_id'] == selected_cluster_id].iloc[0]
+        cluster_posts = filtered_df[filtered_df['cluster_global'] == selected_cluster_id]
+
+        st.subheader(f"Analysis of Narrative: `{selected_cluster_id}`")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Size (Posts)", f"{cluster_details['size']:,}")
+        c2.metric("Duration (Days)", f"{cluster_details['duration_days']:.0f}")
+        c3.metric("Unique Authors", f"{cluster_details['unique_authors']:,}")
+
+        avg_disinfo = cluster_posts['disinfo_marker_count'].mean()
+        if avg_disinfo > 0.5: st.error(f"**High Disinfo Score:** {avg_disinfo:.2f} markers/post")
+        elif avg_disinfo > 0.2: st.warning(f"**Moderate Disinfo Score:** {avg_disinfo:.2f} markers/post")
+        else: st.success(f"**Low Disinfo Score:** {avg_disinfo:.2f} markers/post")
+
+        col1, col2 = st.columns([1, 2])
         with col1:
-            st.metric("Total Posts", f"{len(df_filtered):,}")
-        
+            st.markdown("**Platform Mix**")
+            platform_mix = cluster_posts['source'].value_counts()
+            fig_mix = go.Figure(data=[go.Pie(labels=platform_mix.index, values=platform_mix.values, hole=.5, textinfo='percent+label')])
+            fig_mix.update_layout(showlegend=False, margin=dict(l=0, r=0, t=0, b=0), height=250)
+            st.plotly_chart(fig_mix, use_container_width=True)
+            
+            st.markdown("**Top Entities**")
+            top_entities = get_top_entities(cluster_posts, nlp)
+            if top_entities: st.json(top_entities)
         with col2:
-            st.metric("Unique Authors", f"{df_filtered['author'].nunique():,}")
+            st.markdown("**Word Cloud**")
+            wordcloud_image = generate_wordcloud(cluster_posts)
+            if wordcloud_image is not None:
+                fig, ax = plt.subplots(); ax.imshow(wordcloud_image, interpolation='bilinear'); ax.axis("off"); st.pyplot(fig)
         
-        with col3:
-            st.metric("Platforms", f"{df_filtered['source'].nunique()}")
-        
-        with col4:
-            if clusters is not None:
-                st.metric("Narrative Clusters", f"{clusters.shape[0]:,}")
-            else:
-                st.metric("Time Span", f"{(df_filtered['timestamp'].max() - df_filtered['timestamp'].min()).days} days")
-        
-        with col5:
-            st.metric("Total Engagement", f"{df_filtered['interactions'].sum():,}")
-        
-        st.markdown("---")
-        
-        # Platform distribution
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Platform Distribution")
-            platform_counts = df_filtered['source'].value_counts()
-            
-            fig = px.pie(
-                values=platform_counts.values,
-                names=platform_counts.index,
-                title="Posts by Platform",
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("Activity Timeline")
-            
-            # Resample by day
-            daily_posts = df_filtered.set_index('timestamp').resample('D').size()
-            
-            fig = px.line(
-                x=daily_posts.index,
-                y=daily_posts.values,
-                title="Daily Post Volume",
-                labels={'x': 'Date', 'y': 'Number of Posts'}
-            )
-            fig.update_traces(line_color='#667eea', line_width=2)
-            fig.update_layout(hovermode='x unified')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Top authors
-        st.subheader("🏆 Top 10 Most Active Authors")
-        top_authors = df_filtered['author'].value_counts().head(10).reset_index()
-        top_authors.columns = ['Author', 'Posts']
-        top_authors['Avg Engagement'] = top_authors['Author'].map(
-            df_filtered.groupby('author')['interactions'].mean()
-        ).round(1)
-        
-        fig = px.bar(
-            top_authors,
-            x='Posts',
-            y='Author',
-            orientation='h',
-            title="Most Active Authors",
-            color='Avg Engagement',
-            color_continuous_scale='Viridis'
-        )
-        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Engagement distribution
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Engagement Distribution")
-            fig = px.histogram(
-                df_filtered,
-                x='interactions',
-                nbins=50,
-                title="Post Engagement Distribution",
-                labels={'interactions': 'Interactions', 'count': 'Number of Posts'}
-            )
-            fig.update_traces(marker_color='#764ba2')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("Content Statistics")
-            
-            if 'text_length' in df_filtered.columns:
-                avg_length = df_filtered['text_length'].mean()
-            else:
-                avg_length = df_filtered['text'].str.len().mean()
-            
-            metrics_data = {
-                'Metric': ['Avg Post Length', 'Avg Words/Post', 'Posts with URLs', 'Posts with Hashtags'],
-                'Value': [
-                    f"{avg_length:.0f} chars",
-                    f"{df_filtered['text'].str.split().str.len().mean():.0f}",
-                    f"{df_filtered['text'].str.contains('http').sum():,}" if 'has_url' not in df_filtered.columns else f"{df_filtered['has_url'].sum():,}",
-                    f"{df_filtered['text'].str.contains('#').sum():,}" if 'hashtag_count' not in df_filtered.columns else f"{(df_filtered['hashtag_count'] > 0).sum():,}"
-                ]
-            }
-            st.dataframe(pd.DataFrame(metrics_data), hide_index=True, use_container_width=True)
-    
-    # ==============================================================================
-    # TAB 2: NETWORK ANALYSIS
-    # ==============================================================================
-    
-    with tab2:
-        st.header("🕸️ Network Analysis")
-        
-        if clusters is None:
-            st.warning("⚠️ Cluster data not loaded. Some features may be limited.")
-        
-        st.subheader("Author Co-occurrence Network")
-        
-        # Build simple co-occurrence network
-        with st.spinner("Building network..."):
-            # Sample for performance
-            sample_size = min(10000, len(df_filtered))
-            df_sample = df_filtered.sample(n=sample_size, random_state=42)
-            
-            # Create author-author edges based on cluster participation
-            if 'cluster_global' in df_sample.columns:
-                edges = []
-                for cluster in df_sample['cluster_global'].unique():
-                    authors = df_sample[df_sample['cluster_global'] == cluster]['author'].unique()
-                    if len(authors) > 1:
-                        for i, a1 in enumerate(authors):
-                            for a2 in authors[i+1:]:
-                                edges.append((a1, a2))
-                
-                edge_counts = Counter(edges)
-                
-                # Filter to significant connections
-                significant_edges = [(a1, a2, w) for (a1, a2), w in edge_counts.items() if w >= 3]
-                
-                st.metric("Network Edges", f"{len(significant_edges):,}")
-                st.metric("Connected Authors", f"{len(set([e[0] for e in significant_edges] + [e[1] for e in significant_edges])):,}")
-                
-                # Create network visualization
-                G = nx.Graph()
-                for a1, a2, weight in significant_edges[:500]:  # Limit for visualization
-                    G.add_edge(a1, a2, weight=weight)
-                
-                if G.number_of_nodes() > 0:
-                    # Calculate network metrics
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Network Density", f"{nx.density(G):.4f}")
-                    
-                    with col2:
-                        st.metric("Connected Components", nx.number_connected_components(G))
-                    
-                    with col3:
-                        degrees = [d for n, d in G.degree()]
-                        st.metric("Avg Connections", f"{np.mean(degrees):.1f}")
-                    
-                    # Network visualization using plotly
-                    pos = nx.spring_layout(G, k=0.5, iterations=50, seed=42)
-                    
-                    edge_x = []
-                    edge_y = []
-                    for edge in G.edges():
-                        x0, y0 = pos[edge[0]]
-                        x1, y1 = pos[edge[1]]
-                        edge_x.extend([x0, x1, None])
-                        edge_y.extend([y0, y1, None])
-                    
-                    edge_trace = go.Scatter(
-                        x=edge_x, y=edge_y,
-                        line=dict(width=0.5, color='#888'),
-                        hoverinfo='none',
-                        mode='lines'
-                    )
-                    
-                    node_x = []
-                    node_y = []
-                    node_text = []
-                    node_size = []
-                    
-                    for node in G.nodes():
-                        x, y = pos[node]
-                        node_x.append(x)
-                        node_y.append(y)
-                        degree = G.degree(node)
-                        node_text.append(f"{node}<br>Connections: {degree}")
-                        node_size.append(max(5, degree * 2))
-                    
-                    node_trace = go.Scatter(
-                        x=node_x, y=node_y,
-                        mode='markers',
-                        hoverinfo='text',
-                        text=node_text,
-                        marker=dict(
-                            showscale=True,
-                            colorscale='Viridis',
-                            size=node_size,
-                            color=[G.degree(n) for n in G.nodes()],
-                            colorbar=dict(title="Connections"),
-                            line=dict(width=1, color='white')
-                        )
-                    )
-                    
-                    fig = go.Figure(data=[edge_trace, node_trace],
-                                  layout=go.Layout(
-                                      title="Author Co-occurrence Network",
-                                      showlegend=False,
-                                      hovermode='closest',
-                                      margin=dict(b=0,l=0,r=0,t=40),
-                                      xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                      yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                      height=600
-                                  ))
-                    
+        st.subheader("Top Authors & Sample Posts")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Top 10 Authors in this Narrative**")
+            st.dataframe(cluster_posts['author'].value_counts().head(10))
+        with c2:
+            st.markdown("**Most Engaged Posts**")
+            st.dataframe(cluster_posts[['text', 'interactions']].nlargest(5, 'interactions'), hide_index=True)
+
+# ==============================================================================
+# TAB 3: NETWORK ANALYSIS
+# ==============================================================================
+with tab3:
+    st.header("🕸️ Network Analysis")
+    if author_network is None:
+        st.error("Author network file not loaded. Cannot perform network analysis.")
+    else:
+        nodes_in_filtered_df = set(filtered_df['author'].unique())
+        subgraph_nodes = [node for node in author_network.nodes() if node in nodes_in_filtered_df]
+        G = author_network.subgraph(subgraph_nodes).copy()
+
+        if G.number_of_nodes() < 2:
+            st.warning("Not enough author connections to build a network with the current filters.")
+        else:
+            largest_cc_nodes = max(nx.connected_components(G), key=len)
+            G_largest = G.subgraph(largest_cc_nodes).copy()
+            st.markdown(f"Analyzing the largest connected component of the network with **{G_largest.number_of_nodes():,}** authors and **{G_largest.number_of_edges():,}** connections.")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Network Density", f"{nx.density(G_largest):.4f}")
+            c2.metric("Avg. Connections", f"{np.mean([d for n, d in G_largest.degree()]):.2f}")
+            c3.metric("Communities", G_largest.graph.get('__modularity', 'N/A')) # Louvain is pre-calculated in notebook
+
+            st.subheader("Top 20 Influential Authors")
+            degree = pd.Series(dict(G_largest.degree(weight='weight'))).sort_values(ascending=False)
+            betweenness = pd.Series(nx.betweenness_centrality(G_largest, k=min(100, G_largest.number_of_nodes()))).sort_values(ascending=False)
+            influencer_df = pd.DataFrame({'Degree (Connections)': degree, 'Betweenness (Broker Role)': betweenness}).head(20)
+            st.dataframe(influencer_df, use_container_width=True)
+
+            st.subheader("Interactive Network Graph")
+            render_graph = st.checkbox("Render interactive graph (slow for > 500 nodes)", value=G_largest.number_of_nodes() <= 500)
+            if render_graph:
+                with st.spinner("Calculating graph layout..."):
+                    pos = nx.spring_layout(G_largest, seed=42)
+                    edge_x, edge_y = [], []
+                    for edge in G_largest.edges():
+                        x0, y0 = pos[edge[0]]; x1, y1 = pos[edge[1]]
+                        edge_x.extend([x0, x1, None]); edge_y.extend([y0, y1, None])
+                    edge_trace = go.Scatter(x=edge_x, y=edge_y, line=dict(width=0.5, color='#888'), hoverinfo='none', mode='lines')
+                    node_x, node_y, node_text, node_color, node_size = [], [], [], [], []
+                    for node in G_largest.nodes():
+                        x, y = pos[node]; node_x.append(x); node_y.append(y)
+                        degree = G_largest.degree(node); community = G_largest.nodes[node].get('community', 0)
+                        node_size.append(5 + degree); node_color.append(community)
+                        node_text.append(f"Author: {node}<br>Community: {community}<br>Connections: {degree}")
+                    node_trace = go.Scatter(x=node_x, y=node_y, mode='markers', hoverinfo='text', text=node_text,
+                                            marker=dict(size=node_size, color=node_color, colorscale='Viridis', showscale=True,
+                                                        colorbar=dict(title='Community ID')))
+                    fig = go.Figure(data=[edge_trace, node_trace], layout=go.Layout(showlegend=False, margin=dict(b=0,l=0,r=0,t=40), height=700))
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Most central authors
-                    st.subheader("🎯 Most Central Authors")
-                    
-                    centrality = nx.degree_centrality(G)
-                    top_central = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:10]
-                    
-                    central_df = pd.DataFrame(top_central, columns=['Author', 'Centrality Score'])
-                    central_df['Centrality Score'] = central_df['Centrality Score'].round(3)
-                    
-                    st.dataframe(central_df, hide_index=True, use_container_width=True)
-            
             else:
-                st.info("Cluster information not available for network analysis")
-    
-    # ==============================================================================
-    # TAB 3: TEMPORAL ANALYSIS
-    # ==============================================================================
-    
-    with tab3:
-        st.header("📈 Temporal Analysis")
-        
-        st.subheader("Activity Patterns Over Time")
-        
-        # Time aggregation selection
-        time_agg = st.selectbox(
-            "Time Aggregation",
-            options=['Day', 'Week', 'Month'],
-            index=1
-        )
-        
-        freq_map = {'Day': 'D', 'Week': 'W', 'Month': 'M'}
-        
-        # Aggregate data
-        temporal_data = df_filtered.set_index('timestamp').resample(freq_map[time_agg]).agg({
-            'id': 'count',
-            'interactions': 'sum',
-            'author': 'nunique'
-        }).reset_index()
-        
-        temporal_data.columns = ['Date', 'Posts', 'Total Engagement', 'Unique Authors']
-        
-        # Multi-line chart
-        fig = make_subplots(
-            rows=3, cols=1,
-            subplot_titles=('Post Volume', 'Total Engagement', 'Active Authors'),
-            vertical_spacing=0.1
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=temporal_data['Date'], y=temporal_data['Posts'],
-                      mode='lines', name='Posts', line=dict(color='#667eea', width=2)),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=temporal_data['Date'], y=temporal_data['Total Engagement'],
-                      mode='lines', name='Engagement', line=dict(color='#764ba2', width=2)),
-            row=2, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=temporal_data['Date'], y=temporal_data['Unique Authors'],
-                      mode='lines', name='Authors', line=dict(color='#f093fb', width=2)),
-            row=3, col=1
-        )
-        
-        fig.update_layout(height=800, showlegend=False, hovermode='x unified')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Day of week / Hour patterns
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Activity by Day of Week")
-            dow = df_filtered['timestamp'].dt.day_name()
-            dow_counts = dow.value_counts().reindex([
-                'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'
-            ])
-            
-            fig = px.bar(
-                x=dow_counts.index,
-                y=dow_counts.values,
-                labels={'x': 'Day', 'y': 'Posts'},
-                color=dow_counts.values,
-                color_continuous_scale='Blues'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("Activity by Hour")
-            hour_counts = df_filtered['timestamp'].dt.hour.value_counts().sort_index()
-            
-            fig = px.line(
-                x=hour_counts.index,
-                y=hour_counts.values,
-                labels={'x': 'Hour of Day', 'y': 'Posts'},
-                markers=True
-            )
-            fig.update_traces(line_color='#667eea', line_width=3)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Platform evolution
-        st.subheader("Platform Activity Evolution")
-        
-        platform_temporal = df_filtered.groupby([
-            pd.Grouper(key='timestamp', freq=freq_map[time_agg]),
-            'source'
-        ]).size().reset_index(name='posts')
-        
-        fig = px.area(
-            platform_temporal,
-            x='timestamp',
-            y='posts',
-            color='source',
-            title=f"Platform Activity Over Time ({time_agg}ly)",
-            labels={'timestamp': 'Date', 'posts': 'Number of Posts'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # ==============================================================================
-    # TAB 4: CLUSTER EXPLORER
-    # ==============================================================================
-    
-    with tab4:
-        st.header("🎯 Narrative Cluster Explorer")
-        
-        if clusters is None or 'cluster_global' not in df_filtered.columns:
-            st.warning("⚠️ Cluster data not available")
-        else:
-            # Cluster overview
-            st.subheader("Cluster Overview")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Total Clusters", f"{clusters.shape[0]:,}")
-            
-            with col2:
-                st.metric("Largest Cluster", f"{clusters['size'].max():,} posts")
-            
-            with col3:
-                st.metric("Avg Duration", f"{clusters['duration_days'].mean():.1f} days")
-            
-            with col4:
-                st.metric("Avg Cluster Size", f"{clusters['size'].mean():.0f} posts")
-            
-            # Cluster size distribution
-            st.subheader("Cluster Size Distribution")
-            
-            fig = px.histogram(
-                clusters,
-                x='size',
-                nbins=50,
-                title="Distribution of Cluster Sizes",
-                labels={'size': 'Cluster Size (posts)', 'count': 'Number of Clusters'},
-                log_y=True
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Cluster timeline
-            st.subheader("Cluster Emergence Timeline")
-            
-            fig = px.scatter(
-                clusters,
-                x='start_date',
-                y='size',
-                size='total_engagement',
-                color='dominant_source',
-                hover_data=['cluster_id', 'duration_days', 'unique_authors'],
-                title="Clusters Over Time (bubble size = engagement)",
-                labels={'start_date': 'Start Date', 'size': 'Cluster Size'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Top clusters table
-            st.subheader("🏆 Top 20 Largest Clusters")
-            
-            top_clusters = clusters.nlargest(20, 'size')[[
-                'cluster_id', 'size', 'duration_days', 'total_engagement',
-                'unique_authors', 'dominant_source'
-            ]].copy()
-            
-            top_clusters.columns = ['Cluster ID', 'Size', 'Duration (days)', 
-                                   'Total Engagement', 'Unique Authors', 'Platform']
-            
-            st.dataframe(top_clusters, hide_index=True, use_container_width=True)
-            
-            # Individual cluster explorer
-            st.subheader("🔍 Explore Individual Cluster")
-            
-            selected_cluster = st.selectbox(
-                "Select Cluster",
-                options=clusters['cluster_id'].tolist(),
-                index=0
-            )
-            
-            if selected_cluster:
-                cluster_posts = df_filtered[df_filtered['cluster_global'] == selected_cluster]
-                cluster_info = clusters[clusters['cluster_id'] == selected_cluster].iloc[0]
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Posts", f"{len(cluster_posts):,}")
-                    st.metric("Unique Authors", cluster_info['unique_authors'])
-                
-                with col2:
-                    st.metric("Duration", f"{cluster_info['duration_days']} days")
-                    st.metric("Total Engagement", f"{cluster_info['total_engagement']:,}")
-                
-                with col3:
-                    st.metric("Dominant Platform", cluster_info['dominant_source'])
-                    st.metric("Avg Engagement/Post", f"{cluster_info['avg_engagement']:.1f}")
-                
-                # Sample posts from cluster
-                st.subheader("Sample Posts")
-                sample_posts = cluster_posts.nlargest(5, 'interactions')[['timestamp', 'author', 'text', 'interactions', 'source']]
-                st.dataframe(sample_posts, hide_index=True, use_container_width=True)
-    
-    # ==============================================================================
-    # TAB 5: DISINFORMATION ANALYSIS
-    # ==============================================================================
-    
-    with tab5:
-        st.header("⚠️ Disinformation Markers Analysis")
-        
-        # Check for disinformation marker columns
-        marker_cols = [c for c in df_filtered.columns if c.startswith('marker_')]
-        
-        if not marker_cols:
-            st.warning("⚠️ Disinformation marker data not available")
-        else:
-            # Marker prevalence
-            st.subheader("Disinformation Marker Prevalence")
-            
-            marker_stats = []
-            for col in marker_cols:
-                marker_name = col.replace('marker_', '').replace('_', ' ').title()
-                count = df_filtered[col].sum()
-                percentage = (count / len(df_filtered)) * 100
-                marker_stats.append({
-                    'Marker Type': marker_name,
-                    'Count': int(count),
-                    'Percentage': f"{percentage:.2f}%"
-                })
-            
-            marker_df = pd.DataFrame(marker_stats).sort_values('Count', ascending=False)
-            
-            fig = px.bar(
-                marker_df,
-                x='Count',
-                y='Marker Type',
-                orientation='h',
-                title="Disinformation Marker Prevalence",
-                color='Count',
-                color_continuous_scale='Reds'
-            )
-            fig.update_layout(yaxis={'categoryorder': 'total ascending'})
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.dataframe(marker_df, hide_index=True, use_container_width=True)
-            
-            # Marker co-occurrence
-            st.subheader("Marker Co-occurrence Analysis")
-            
-            if 'disinfo_marker_count' in df_filtered.columns:
-                posts_with_markers = df_filtered[df_filtered['disinfo_marker_count'] > 0]
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.metric("Posts with Markers", f"{len(posts_with_markers):,}")
-                    st.metric("Percentage", f"{(len(posts_with_markers)/len(df_filtered)*100):.1f}%")
-                
-                with col2:
-                    st.metric("Avg Markers per Post", f"{df_filtered['disinfo_marker_count'].mean():.2f}")
-                    st.metric("Max Markers in Single Post", f"{df_filtered['disinfo_marker_count'].max()}")
-                
-                # Distribution of marker counts
-                marker_count_dist = df_filtered['disinfo_marker_count'].value_counts().sort_index()
-                
-                fig = px.bar(
-                    x=marker_count_dist.index,
-                    y=marker_count_dist.values,
-                    labels={'x': 'Number of Markers', 'y': 'Number of Posts'},
-                    title="Distribution of Marker Counts per Post"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Temporal evolution of markers
-            st.subheader("Temporal Evolution of Disinformation Markers")
-            
-            temporal_markers = df_filtered.set_index('timestamp')[marker_cols].resample('W').sum()
-            
-            # Select top 5 markers for visualization
-            top_markers = marker_df.head(5)['Marker Type'].apply(
-                lambda x: 'marker_' + x.lower().replace(' ', '_')
-            ).tolist()
-            
-            fig = go.Figure()
-            for marker in top_markers:
-                if marker in temporal_markers.columns:
-                    marker_name = marker.replace('marker_', '').replace('_', ' ').title()
-                    fig.add_trace(go.Scatter(
-                        x=temporal_markers.index,
-                        y=temporal_markers[marker],
-                        mode='lines',
-                        name=marker_name
-                    ))
-            
-            fig.update_layout(
-                title="Top 5 Disinformation Markers Over Time (Weekly)",
-                xaxis_title="Date",
-                yaxis_title="Occurrences",
-                hovermode='x unified',
-                height=500
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # ==============================================================================
-    # TAB 6: SEARCH & INVESTIGATE
-    # ==============================================================================
-    
-    with tab6:
-        st.header("🔍 Search & Investigate")
-        
-        st.subheader("Search Posts")
-        
-        search_query = st.text_input("Enter search terms", placeholder="vaccine injury, climate hoax, etc.")
-        
-        if search_query:
-            # Case-insensitive search in text
-            search_results = df_filtered[
-                df_filtered['text'].str.contains(search_query, case=False, na=False)
-            ]
-            
-            st.metric("Results Found", f"{len(search_results):,}")
-            
-            if len(search_results) > 0:
-                # Show results
-                st.subheader("Search Results")
-                
-                # Sort by engagement
-                top_results = search_results.nlargest(20, 'interactions')[
-                    ['timestamp', 'author', 'source', 'text', 'interactions']
-                ].copy()
-                
-                top_results['timestamp'] = top_results['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
-                top_results['text'] = top_results['text'].str[:200] + '...'
-                
-                st.dataframe(top_results, hide_index=True, use_container_width=True)
-                
-                # Export results
-                csv = search_results.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Results as CSV",
-                    data=csv,
-                    file_name=f"search_results_{search_query.replace(' ', '_')}.csv",
-                    mime="text/csv"
-                )
-        
-        st.markdown("---")
-        
-        # Author lookup
-        st.subheader("Author Profile")
-        
-        author_search = st.text_input("Enter author name", placeholder="username")
-        
-        if author_search:
-            author_posts = df_filtered[df_filtered['author'] == author_search]
-            
-            if len(author_posts) > 0:
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Total Posts", f"{len(author_posts):,}")
-                
-                with col2:
-                    st.metric("Platforms Used", author_posts['source'].nunique())
-                
-                with col3:
-                    st.metric("Total Engagement", f"{author_posts['interactions'].sum():,}")
-                
-                with col4:
-                    st.metric("Avg Engagement/Post", f"{author_posts['interactions'].mean():.1f}")
-                
-                # Activity timeline
-                author_timeline = author_posts.set_index('timestamp').resample('D').size()
-                
-                fig = px.line(
-                    x=author_timeline.index,
-                    y=author_timeline.values,
-                    title=f"Activity Timeline: {author_search}",
-                    labels={'x': 'Date', 'y': 'Posts'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Platform distribution
-                platform_dist = author_posts['source'].value_counts()
-                
-                fig = px.pie(
-                    values=platform_dist.values,
-                    names=platform_dist.index,
-                    title="Platform Distribution"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Recent posts
-                st.subheader("Recent Posts")
-                recent = author_posts.nlargest(10, 'timestamp')[
-                    ['timestamp', 'source', 'text', 'interactions']
-                ].copy()
-                recent['timestamp'] = recent['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
-                recent['text'] = recent['text'].str[:200] + '...'
-                
-                st.dataframe(recent, hide_index=True, use_container_width=True)
-            else:
-                st.info(f"No posts found for author: {author_search}")
+                st.info("Graph rendering disabled due to size. Use Gephi for large network visualization.")
 
 # ==============================================================================
-# RUN APP
+# TAB 4: METHODOLOGY
 # ==============================================================================
+with tab4:
+    st.header("⚙️ Methodology Explained")
+    st.markdown("This dashboard is the result of a multi-stage data pipeline designed to map and analyze disinformation ecosystems.")
+    
+    with st.expander("### 1. Data Collection", expanded=True):
+        st.markdown("- **Multi-Source Aggregation:** Data was collected from diverse platforms including Reddit, Telegram, 4chan, and News APIs to capture a wide spectrum of online discourse.")
+        st.markdown("- **Keyword-Driven Targeting:** The collection was guided by a curated list of keywords and phrases related to prominent disinformation themes (e.g., vaccine misinformation, election fraud, climate denial).")
 
-if __name__ == "__main__":
-    main()
+    with st.expander("### 2. Feature Engineering"):
+        st.markdown("""
+        To understand the nuances of each post, we calculated various features:
+        - **Semantic Features (Embeddings):** The text of each post was converted into a 384-dimensional vector using the `all-MiniLM-L6-v2` sentence transformer model. These vectors capture the *meaning* of the text, allowing us to group posts that are semantically similar even if they don't use the exact same words.
+        - **Linguistic & Marker Features:** We analyzed writing style (length, capitalization) and scanned for specific phrases commonly associated with disinformation tactics (e.g., "do your own research," "deep state").
+        """)
+
+    with st.expander("### 3. Time-Aware Adaptive Clustering (HDBSCAN)"):
+        st.markdown("""
+        This is the core of our narrative detection. The goal is to group similar posts into "narrative clusters."
+        - **Time-Aware:** The data is first sliced into 2-month time windows. Clustering is performed independently within each window. This allows us to track how narratives evolve, appear, and fade over time, rather than treating a decade of data as a single static block.
+        - **Adaptive Clustering (HDBSCAN):** We chose the **HDBSCAN** algorithm for two key reasons:
+            1.  **It finds clusters of varying shapes and densities.** Real-world narratives aren't uniform. HDBSCAN can identify both small, tightly-coordinated message campaigns and larger, more diffuse conversations.
+            2.  **It automatically identifies noise.** HDBSCAN excels at labeling posts that don't belong to any coherent group as "noise." This is crucial for filtering out random chatter and focusing our analysis only on true, cohesive narratives. This is why you see a "Noise Percentage" in the analysis—it's a feature, not a bug!
+        """)
+
+    with st.expander("### 4. Network Analysis"):
+        st.markdown("- **Author Co-occurrence Network:** We built a graph where each node is an author. An edge connects two authors if they both participated in the same narrative cluster. The more narratives they share, the stronger the connection.")
+        st.markdown("- **Community Detection & Influencer Analysis:** Using the Louvain algorithm and centrality metrics on this network, we can identify influential authors and "echo chambers"—groups of authors who are more densely connected to each other than to the rest of the network.")
